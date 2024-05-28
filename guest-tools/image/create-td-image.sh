@@ -37,6 +37,9 @@ SIZE=50
 GUEST_USER=${GUEST_USER:-"tdx"}
 GUEST_PASSWORD=${GUEST_PASSWORD:-"123456"}
 GUEST_HOSTNAME=${GUEST_HOSTNAME:-"tdx-guest"}
+BINARIES_PATH=${BINARIES_PATH:-"./binaries"}
+RAM_BINARIES_PATH=${RAM_BINARIES_PATH:-"${CURR_DIR}/ram-binaries"}
+BINARY_DEST_DIR="/bin"
 
 ok() {
     echo -e "\e[1;32mSUCCESS: $*\e[0;0m"
@@ -68,17 +71,22 @@ Usage: $(basename "$0") [OPTION]...
   -o <output file>          Specify the output file, default is tdx-guest-ubuntu-24.04.qcow2.
                             Please make sure the suffix is qcow2. Due to permission consideration,
                             the output file will be put into /tmp/<output file>.
+  -b <binary path>          Path to the binary to be added to the initrd
+  -d <binary destination>   Destination directory within initrd, default is /bin
 EOM
 }
 
 process_args() {
-    while getopts "o:s:n:u:p:r:fch" option; do
+    while getopts "o:s:n:u:p:b:d:r:rfch" option; do
         case "$option" in
         o) GUEST_IMG=$OPTARG ;;
         s) SIZE=$OPTARG ;;
         n) GUEST_HOSTNAME=$OPTARG ;;
         u) GUEST_USER=$OPTARG ;;
         p) GUEST_PASSWORD=$OPTARG ;;
+        b) BINARIES_PATH=$OPTARG ;;
+        d) BINARY_DEST_DIR=$OPTARG ;;
+        r) RAM_BINARIES_PATH=$OPTARG ;; 
         f) FORCE_RECREATE=true ;;
         h)
             usage
@@ -223,13 +231,16 @@ EOT
 
 setup_guest_image() {
     virt-customize -a /tmp/${GUEST_IMG} \
-       --mkdir /tmp/tdx/ \
-       --copy-in ${CURR_DIR}/setup.sh:/tmp/tdx/ \
-       --copy-in ${CURR_DIR}/../../setup-tdx-guest.sh:/tmp/tdx/ \
-       --copy-in ${CURR_DIR}/../../setup-tdx-common:/tmp/tdx \
-       --copy-in ${CURR_DIR}/../../setup-tdx-config:/tmp/tdx \
-       --copy-in ${CURR_DIR}/../../attestation/:/tmp/tdx \
-       --run-command "/tmp/tdx/setup.sh"
+        --mkdir /tmp/tdx/ \
+        --mkdir /tmp/tdx/bin \
+        --copy-in ${CURR_DIR}/setup.sh:/tmp/tdx/ \
+        --copy-in ${CURR_DIR}/../../setup-tdx-guest.sh:/tmp/tdx/ \
+        --copy-in ${CURR_DIR}/../../setup-tdx-common:/tmp/tdx \
+        --copy-in ${CURR_DIR}/../../setup-tdx-config:/tmp/tdx \
+        --copy-in ${CURR_DIR}/../../attestation/:/tmp/tdx \
+        --copy-in ${BINARIES_PATH}:/tmp/tdx/bin \
+        --run-command "mv /tmp/tdx/bin/${BINARIES_PATH}/* /bin/" \
+        --run-command "/tmp/tdx/setup.sh"
     if [ $? -eq 0 ]; then
         ok "Setup guest image..."
     else
@@ -237,9 +248,105 @@ setup_guest_image() {
     fi
 }
 
+inject_binary_into_initrd() {
+    # Load the NBD module
+    sudo modprobe nbd max_part=8
+
+    # Connect the image
+    sudo qemu-nbd -c /dev/nbd0 /tmp/${GUEST_IMG}
+
+    # Probe the partitions
+    sudo partprobe /dev/nbd0
+
+    # Identify the partitions
+    local root_partition
+    root_partition=$(lsblk -lno NAME,TYPE | grep part | awk '{print $1}' | head -n 1)
+
+    # Mount the root partition
+    sudo mount /dev/$root_partition /mnt
+
+    # Extract and modify the initrd
+    sudo mkdir /mnt/initrd
+    sudo cp /mnt/boot/initrd.img-* /mnt/initrd/initrd.img
+    pushd /mnt/initrd
+    # sudo gzip -d initrd.img
+    sudo cpio -id < initrd.img
+
+    # Add the binary
+    sudo cp ${BINARIES_PATH} ${BINARY_DEST_DIR}/
+    sudo chmod +x ${BINARY_DEST_DIR}/$(basename ${BINARIES_PATH})
+
+    # Add execution to init script
+    echo "${BINARY_DEST_DIR}/$(basename ${BINARIES_PATH})" | sudo tee -a /mnt/initrd/init
+
+    # Repack the initrd
+    find . | cpio -o -H newc | gzip > /mnt/boot/initrd.img-$(basename /mnt/boot/initrd.img-*)
+    popd
+
+    # Cleanup
+    sudo umount /mnt
+    sudo qemu-nbd -d /dev/nbd0
+}
+
+inject_ram_binaries_into_initrd() {
+    # Install necessary tools
+    sudo apt-get install -y cpio gzip libguestfs-tools file
+
+    # Mount the guest image
+    mkdir /mnt/guest
+    guestmount -a /tmp/${GUEST_IMG} -i /mnt/guest
+
+    # Unpack the initrd
+    mkdir /tmp/initrd
+    cd /tmp/initrd
+
+    # Check if the initrd is in gzip format
+    local is_compressed=0
+    if file /mnt/guest/boot/initrd.img-* | grep -q gzip; then
+        gzip -dc < /mnt/guest/boot/initrd.img-* | cpio -idmv
+        is_compressed=1
+    else
+        # If the initrd is not compressed, extract it directly
+        cpio -idmv < /mnt/guest/boot/initrd.img-*
+    fi
+
+    # Add the binaries
+    cp ${RAM_BINARIES_PATH}/* .
+
+    # Modify the startup script
+    for binary in *; do
+        echo "Adding $binary to initrd"
+        # Make the binaries executable
+        chmod +x $binary
+        echo "./$binary" >> init
+    done
+
+    # Repack the initrd
+    if [ "$is_compressed" -eq 1 ]; then
+        find . | cpio -o -H newc | gzip > /mnt/guest/boot/myinitrd.img
+    else
+        find . | cpio -o -H newc > /mnt/guest/boot/myinitrd.img
+    fi
+
+    # Unmount the guest image
+    cd /
+    guestunmount /mnt/guest
+}
+
 cleanup() {
     if [[ -f ${CURR_DIR}/"SHA256SUMS" ]]; then
         rm ${CURR_DIR}/"SHA256SUMS"
+    fi
+
+    # Unmount and remove /mnt/guest if it still exists
+    if [ -d /mnt/guest ]; then
+        guestunmount /mnt/guest
+        rm -rf /mnt/guest
+    fi
+
+    # Remove /tmp/initrd if it still exists
+    if [ -d /tmp/initrd ]; then
+        rm -rf /tmp/initrd
     fi
     ok "Cleanup!"
 }
@@ -281,6 +388,9 @@ create_guest_image
 config_cloud_init
 
 setup_guest_image
+
+#inject_ram_binaries_into_initrd
+#inject_binary_into_initrd
 
 cleanup
 

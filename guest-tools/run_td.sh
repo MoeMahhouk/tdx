@@ -30,13 +30,13 @@ SSH_PORT=10022
 PROCESS_NAME=td
 # approach 1 : talk to QGS directly
 QUOTE_ARGS="-device vhost-vsock-pci,guest-cid=3"
+# execute without TDX primitives
 qemu-system-x86_64 -D /tmp/tdx-guest-td.log \
 		   -accel kvm \
 		   -m 2G -smp 16 \
 		   -name ${PROCESS_NAME},process=${PROCESS_NAME},debug-threads=on \
 		   -cpu host \
-		   -object tdx-guest,id=tdx \
-		   -machine q35,kernel_irqchip=split,confidential-guest-support=tdx,hpet=off \
+		   -machine q35,kernel_irqchip=split,hpet=off \
 		   -bios ${TDVF_FIRMWARE} \
 		   -nographic -daemonize \
 		   -nodefaults \
@@ -45,6 +45,23 @@ qemu-system-x86_64 -D /tmp/tdx-guest-td.log \
 		   -device virtio-blk-pci,drive=virtio-disk0 \
 		   ${QUOTE_ARGS} \
 		   -pidfile /tmp/tdx-demo-td-pid.pid
+		   
+# execute with TDX primitives
+#qemu-system-x86_64 -D /tmp/tdx-guest-td.log \
+#		   -accel kvm \
+#		   -m 2G -smp 16 \
+#		   -name ${PROCESS_NAME},process=${PROCESS_NAME},debug-threads=on \
+#		   -cpu host \
+#		   -object tdx-guest,id=tdx \
+#           -machine q35,kernel_irqchip=split,confidential-guest-support=tdx,hpet=off \
+#		   -bios ${TDVF_FIRMWARE} \
+#		   -nographic -daemonize \
+#		   -nodefaults \
+#		   -device virtio-net-pci,netdev=nic0_td -netdev user,id=nic0_td,hostfwd=tcp::${SSH_PORT}-:22 \
+#		   -drive file=${TD_IMG},if=none,id=virtio-disk0 \
+#		   -device virtio-blk-pci,drive=virtio-disk0 \
+#		   ${QUOTE_ARGS} \
+#		   -pidfile /tmp/tdx-demo-td-pid.pid
 
 PID_TD=$(cat /tmp/tdx-demo-td-pid.pid)
 
